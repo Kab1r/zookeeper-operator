@@ -90,3 +90,7 @@ disableFinalizer: false
 ## In order to enable gathering metrics by Prometheus etc... bind to 0.0.0.0
 metricsBindAddress: 127.0.0.1
 metricsPort: "6000"
+
+tracing: false
+tracingEndpoint: "127.0.0.1:4317"
+tracingSampleRatePerMillion: "100000"

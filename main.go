@@ -24,11 +24,18 @@ import (
 	"github.com/pravega/zookeeper-operator/pkg/version"
 	zkClient "github.com/pravega/zookeeper-operator/pkg/zk"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otelsdkresource "go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
+	"k8s.io/component-base/tracing"
+
+	tracingV1 "k8s.io/component-base/tracing/api/v1"
+	nodeutil "k8s.io/component-helpers/node/util"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -62,10 +69,17 @@ func printVersion() {
 
 func main() {
 	var metricsAddr string
+	var tracingEndpoint string
+	var tracingSamplingRateInt int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "127.0.0.1:6000", "The address the metric endpoint binds to.")
+	flag.StringVar(&tracingEndpoint, "tracing-endpoint", "", "The endpoint of the collector this component will report traces to.")
+	flag.IntVar(&tracingSamplingRateInt, "tracing-sampling-rate", 100000, "The number of samples to collect per million spans.")
 	flag.Parse()
+	tracingSamplingRate := int32(tracingSamplingRateInt)
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
+
+	log.Info(fmt.Sprintf("Tracing configuration: endpoint=%s, samplingRate=%d", tracingEndpoint, tracingSamplingRate))
 
 	namespaces, err := getWatchNamespace()
 	if err != nil {
@@ -109,14 +123,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
+
 	// Become the leader before proceeding
-	err = utils.BecomeLeader(context.TODO(), cfg, "zookeeper-operator-lock", operatorNs)
+	err = utils.BecomeLeader(ctx, cfg, "zookeeper-operator-lock", operatorNs)
 	if err != nil {
 		log.Error(err, "")
 		os.Exit(1)
 	}
+	hostname, err := nodeutil.GetHostname("")
+	if err != nil {
+		log.Error(err, "failed to get hostname")
+	}
+	resourceOpts := []otelsdkresource.Option{
+		otelsdkresource.WithAttributes(
+			semconv.ServiceNameKey.String("zookeeper-operator"),
+			semconv.HostNameKey.String(hostname),
+		),
+	}
+	tracingConfig := tracingV1.TracingConfiguration{}
+	if tracingEndpoint != "" {
+		tracingConfig.Endpoint = &tracingEndpoint
+		tracingConfig.SamplingRatePerMillion = &tracingSamplingRate
+	}
+	tp, err := tracing.NewProvider(ctx, &tracingConfig, []otlptracegrpc.Option{}, resourceOpts)
+	tracer := tp.Tracer("zookeeper-operator")
+	if err != nil {
+		log.Error(err, "failed to create tracing provider")
+	}
+	defer tp.Shutdown(ctx)
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgrConfig := ctrl.GetConfigOrDie()
+	if err == nil {
+		mgrConfig.Wrap(tracing.WrapperFor(tp))
+	}
+	mgr, err := ctrl.NewManager(mgrConfig, ctrl.Options{
 		Scheme:             scheme,
 		Cache:              cache.Options{Namespaces: managerNamespaces},
 		MetricsBindAddress: metricsAddr,
@@ -125,12 +166,12 @@ func main() {
 		log.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-
 	if err = (&controllers.ZookeeperClusterReconciler{
 		Client:   mgr.GetClient(),
 		Log:      ctrl.Log.WithName("controllers").WithName("ZookeeperCluster"),
 		Scheme:   mgr.GetScheme(),
 		ZkClient: new(zkClient.DefaultZookeeperClient),
+		Tracer:   tracer,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "ZookeeperCluster")
 		os.Exit(1)

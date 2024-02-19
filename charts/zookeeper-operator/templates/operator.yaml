@@ -42,6 +42,10 @@ spec:
         {{- if .Values.disableFinalizer }}
         - -disableFinalizer
         {{- end }}
+        {{- if .Values.tracing }}
+        - -tracing-endpoint={{ .Values.tracingEndpoint }}
+        - -tracing-sampling-rate={{ .Values.tracingSampleRatePerMillion }}
+        {{- end }}
         env:
         - name: WATCH_NAMESPACE
           value: "{{ .Values.watchNamespace }}"
